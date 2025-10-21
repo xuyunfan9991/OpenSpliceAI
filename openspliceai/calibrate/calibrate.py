@@ -26,8 +26,13 @@ def get_logits_labels(model, loader, device, params):
             inputs, labels = inputs.to(device), labels.to(device)
             inputs, labels = clip_datapoints(inputs, labels, params["CL"], CL_max, params["N_GPUS"])
             logits = model(inputs)
-            logits_list.append(logits)
-            labels_list.append(labels)
+
+            # Move tensors to CPU immediately to avoid exhausting GPU memory
+            logits_list.append(logits.detach().cpu())
+            labels_list.append(labels.detach().cpu())
+
+            # Explicitly release references to GPU tensors before the next iteration
+            del logits, inputs, labels
 
     logits = torch.cat(logits_list).permute(0, 2, 1).contiguous()
     labels = torch.cat(labels_list).permute(0, 2, 1).contiguous().argmax(dim=-1)
