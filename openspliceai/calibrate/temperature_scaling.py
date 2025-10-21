@@ -61,6 +61,8 @@ class ModelWithTemperature(nn.Module):
         self.temperature[c]. If logits is [N, C], we broadcast over the batch dimension.
         """
         temperature = torch.clamp(self.temperature, min=0.05, max=5.0)
+        if temperature.device != logits.device:
+            temperature = temperature.to(logits.device)
         return logits / temperature
 
     def save_temperature(self, filepath):
@@ -198,7 +200,7 @@ class ModelWithTemperature(nn.Module):
         print(f'{phase} - NLL: {nll:.4f}, ECE: {ece:.4f}')
 
     def compute_ece_nll(self, logits, labels):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = logits.device
         nll_criterion = nn.CrossEntropyLoss().to(device)
         ece_criterion = _ECELoss().to(device)
         nll = nll_criterion(logits.to(device), labels.to(device)).item()
