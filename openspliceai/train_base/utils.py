@@ -563,15 +563,36 @@ def categorical_crossentropy_2d(y_true, y_pred):
 
 
 def focal_loss(y_true, y_pred, alpha=0.25, gamma=2.0):
+    """Compute 2D focal loss with optional class weighting.
+
+    Parameters
+    ----------
+    y_true : torch.Tensor
+        One-hot encoded ground-truth labels with shape ``(batch, classes, length)``.
+    y_pred : torch.Tensor
+        Model predictions with the same shape as ``y_true``.
+    alpha : float, Sequence[float], or torch.Tensor, optional
+        Weighting factor for each class. If a scalar is provided it is applied to
+        all classes uniformly. Defaults to ``0.25``.
+    gamma : float, optional
+        Focusing parameter that controls down-weighting of easy examples.
+        Defaults to ``2.0``.
     """
-    Compute 2D focal loss.
-    """
-    # Ensuring numerical stability
-    gamma = 2
+
     epsilon = 1e-10
-    return - torch.mean(y_true[:, 0, :]*torch.log(y_pred[:, 0, :]+epsilon) * torch.pow(torch.sub(1, y_pred[:, 0, :]), gamma)
-                        + y_true[:, 1, :]*torch.log(y_pred[:, 1, :]+epsilon) * torch.pow(torch.sub(1, y_pred[:, 1, :]), gamma)
-                        + y_true[:, 2, :]*torch.log(y_pred[:, 2, :]+epsilon) * torch.pow(torch.sub(1, y_pred[:, 2, :]), gamma))
+    y_pred = torch.clamp(y_pred, epsilon, 1.0 - epsilon)
+
+    alpha_tensor = torch.as_tensor(alpha, dtype=y_pred.dtype, device=y_pred.device)
+    if alpha_tensor.numel() == 1:
+        alpha_tensor = alpha_tensor.expand(y_pred.size(1))
+    alpha_tensor = alpha_tensor.view(1, -1, *([1] * (y_pred.dim() - 2)))
+
+    log_probs = torch.log(y_pred)
+    focal_weight = torch.pow(1.0 - y_pred, gamma)
+
+    loss = -alpha_tensor * y_true * focal_weight * log_probs
+    loss = loss.sum(dim=1)
+    return loss.mean()
 
 
 def train_model(model, optimizer, scheduler, train_h5f, valid_h5f, test_h5f, train_idxs, val_idxs, test_idxs,
