@@ -141,8 +141,10 @@ def create_datafile(args):
     seq_dict = SeqIO.to_dict(SeqIO.parse(args.genome_fasta, "fasta"))
         
     # Find all distinct chromosomes and split them
-    TRAIN_CHROM_GROUP, TEST_CHROM_GROUP = utils.split_chromosomes(seq_dict, method=args.split_method, split_ratio=args.split_ratio)
+    TRAIN_CHROM_GROUP, VAL_CHROM_GROUP, TEST_CHROM_GROUP = utils.split_chromosomes(seq_dict, method=args.split_method, split_ratio=args.split_ratio)
     print("* TRAIN_CHROM_GROUP: ", TRAIN_CHROM_GROUP)
+    if VAL_CHROM_GROUP:
+        print("* VAL_CHROM_GROUP: ", VAL_CHROM_GROUP)
     print("* TEST_CHROM_GROUP: ", TEST_CHROM_GROUP)
 
     # Collect sequences and labels for testing and/or training groups
@@ -153,6 +155,10 @@ def create_datafile(args):
     elif args.chr_split == 'train-test':
         print("> Creating train datafile...")
         train_data = get_sequences_and_labels(db, args.output_dir, seq_dict, TRAIN_CHROM_GROUP, 'train', parse_type=args.parse_type, biotype=args.biotype, canonical_only=args.canonical_only, write_fasta=args.write_fasta)
+        val_data = None
+        if VAL_CHROM_GROUP:
+            print("> Creating validation datafile...")
+            val_data = get_sequences_and_labels(db, args.output_dir, seq_dict, VAL_CHROM_GROUP, 'validation', parse_type=args.parse_type, biotype=args.biotype, canonical_only=args.canonical_only, write_fasta=args.write_fasta)
         print("> Creating test datafile...")
         test_data = get_sequences_and_labels(db, args.output_dir, seq_dict, TEST_CHROM_GROUP, 'test', parse_type=args.parse_type, biotype=args.biotype, canonical_only=args.canonical_only, write_fasta=args.write_fasta)
         if args.remove_paralogs:
@@ -160,11 +166,16 @@ def create_datafile(args):
             print("> Removing homologous sequences in test...")
             train_data, test_data = paralogs.remove_paralogous_sequences(train_data, test_data, args.min_identity, args.min_coverage, args.output_dir, "test")
 
-        # Split the training data into training and validation sets (90:10 split)
-        print("> Splitting training data into training and validation sets...")
-        train_data, val_data = utils.split_train_val(train_data, args.val_split_ratio)
-        if args.remove_paralogs:
-            # Remove homologous sequences
+        # If validation chromosomes are not specified, fall back to random split
+        if val_data is None:
+            print("> Splitting training data into training and validation sets...")
+            train_data, val_data = utils.split_train_val(train_data, args.val_split_ratio)
+            if args.remove_paralogs:
+                # Remove homologous sequences
+                print("> Removing homologous sequences in validation...")
+                train_data, val_data = paralogs.remove_paralogous_sequences(train_data, val_data, args.min_identity, args.min_coverage, args.output_dir, "validation")
+        elif args.remove_paralogs:
+            # Remove homologous sequences between train and validation (chromosome-based split)
             print("> Removing homologous sequences in validation...")
             train_data, val_data = paralogs.remove_paralogous_sequences(train_data, val_data, args.min_identity, args.min_coverage, args.output_dir, "validation")
 

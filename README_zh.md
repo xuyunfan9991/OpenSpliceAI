@@ -12,7 +12,7 @@ OpenSpliceAI 是在 PyTorch 中重构的 SpliceAI，实现了从原始基因组�
   - 参考基因组 FASTA（例：`data/genome.fa` + `.fai`）。
   - 组织/物种对应的 GTF/GFF 注释文件。
   - SpliceAI 官方 annotation（示例：`data/grch38.txt`）或自定义注释。
-  - 组织表达矩阵：RBP 表达 `data/tissue_rbp_matrix.csv` 与高变基因 `data/developmental_system_hvg.csv`。
+  - 组织表达矩阵：已拼接且标准化的 RBP+HVG 矩阵，如 `data/tissue_expression_features_scaled.csv`。
 
 安装完成后可用下列命令快速检查：
 
@@ -66,6 +66,9 @@ openspliceai create-data \
 
 输出目录一般包含 `dataset_train.h5`、`dataset_validation.h5`、`dataset_test.h5` 及相关日志/统计文件，后续 `train`、`transfer` 都直接引用（命名中需保留 `train`/`validation`/`test` 关键字）。
 
+> **提示：组织特异 GFF3 预处理**  
+> `workflow/step_all.sh` 将 `step0`~`step3` 脚本串联起来，可通过 `bash workflow/step_all.sh <tissue>` 一键生成 `<tissue>_step3.gff3`。每个 step 会过滤 isoform、转换 GFF3、重命名 transcript→mRNA、并补充 `gene_biotype`，供 `create-data` 使用。
+
 ---
 
 ## 4. Step 2：训练基础模型 (`train`)
@@ -96,35 +99,35 @@ openspliceai train \
 
 ## 5. Step 3：生成组织条件向量 (`prepare_rbp_expression`)
 
-FiLM 需要一个固定的条件向量。我们提供 RBP 表达矩阵和高变基因矩阵，它们具有相同行索引（组织名）。运行脚本即可将两者拼接、标准化，并保存 JSON/NPY：
+FiLM 需要一个固定的条件向量。现在直接使用单个矩阵（已包含 RBP + HVG，且已标准化）例如 `data/tissue_expression_features_scaled.csv`，行是组织名、列是特征名。运行：
 
 ```bash
 python -m openspliceai.scripts.prepare_rbp_expression \
-  --matrix data/tissue_rbp_matrix.csv \
-  --hvg-matrix data/developmental_system_hvg.csv \
+  --matrix /home1/xyf/project/github/OpenSpliceAI/data/tissue_expression_features_scaled.csv \
   --tissue limb \
   --output data/limb_features.json \
   --format json \
-  --standardize zscore \
-  --hvg-standardize zscore
+  --standardize none
 ```
 
 输出文件格式：
 
 ```json
 {
-  "values": [...],          # RBP + HVG 拼接后的向量
-  "rbp_names": ["ADAR", ..., "HVGene_001", ...]
+  "values": [...],          # RBP + HVG 向量
+  "rbp_names": ["feature1", "feature2", ...]
 }
 ```
 
-**务必在训练和推理时复用同一文件**，checkpoint 会记录 `rbp_dim` 与 `rbp_names` 用于校验。如果你有额外的组织特征，也可以将其加入 CSV，再通过该脚本导出。
+**务必在训练和推理时复用同一文件**，checkpoint 会记录 `rbp_dim` 与 `rbp_names` 用于校验。如果你有额外的组织特征，可直接追加到该矩阵列中，再用本脚本导出。
 
 ---
 
 ## 6. Step 4：FiLM 微调 (`transfer`)
 
-`transfer` 在基础模型之上加载 FiLM 层，将组织向量注入后半段残差块。典型命令：
+`transfer` 在基础模型之上加载 FiLM 侧支 MLP，将组织向量注入主干末端（所有残差块之后、最终 1×1 卷积之前），对 32 个通道做一次乘加调制。根据数据量，可选择 **单组织模式**（一次只微调一个组织）或 **多组织共享模式**（一次加载多个组织，以便同一个 checkpoint 在推理时切换条件向量）。
+
+### 6.1 单组织模式（与旧版用法一致）
 
 ```bash
 openspliceai transfer \
@@ -134,21 +137,63 @@ openspliceai transfer \
   --flanking-size 10000 \
   --epochs 5 \
   --rbp-expression data/limb_features.json \
-  --film-start-layer 7 \
   --unfreeze 4 \
   --output-dir runs/limb_film \
   --project-name limb_film
 ```
 
-关键参数说明：
+关键参数说明（新版 FiLM 逻辑）：
 
 - 与 `train` 相同，`train-dataset` 名称含 `train` 即可，程序会自动定位同目录 `dataset_validation.h5` 作为验证集。
-- `--rbp-expression`：指向前一步生成的 JSON/NPY，内部包含 RBP + HVG 特征。
-- `--film-start-layer`：FiLM 生效的 Residual Unit 起点（1-based），一般取网络后半段（如 12 层网络设为 7）。
-- `--unfreeze` / `--unfreeze-all`：控制微调时解冻多少层；默认只训练被 FiLM 改动的层，可根据数据量调整。
-- 训练日志结构与 `train` 类似，`model_best.pt` 中同时记录了 `rbp_dim`、`rbp_names` 等元信息。未提供 `--rbp-expression` 时，FiLM 会退化为 γ=1/β=0，表现等同基础模型。
+- `--rbp-expression`：指向前一步生成的 JSON/NPY，内部包含 RBP + HVG 特征（示例维度 753，经 Z-score 标准化或已提供标准化矩阵）。
+- FiLM 注入位置固定在主干末端（final 1×1 卷积前），无需 `--film-start-layer`。
+- FiLM 侧支 MLP：`Linear(in_dim→128) → LayerNorm → ReLU → Dropout(0.2) → Linear(128→2*channels)`，输出层权重/偏置零初始化，确保初始 γ=1、β=0（热启动）。
+- 训练时默认冻结主干，始终解冻 FiLM 侧支和最终 1×1 卷积头；`--unfreeze` 额外解冻末端若干 ResidualUnit，`--unfreeze-all` 可全模型联训。
+- 训练日志结构与 `train` 类似，`model_best.pt` 中记录了 `rbp_dim`、`rbp_names` 等元信息。未提供 `--rbp-expression` 时，FiLM 会退化为 γ=1/β=0，表现等同基础模型。
 
-要比较多个组织，可重复执行 `prepare_rbp_expression` + `transfer`，每个组织单独生成一个 checkpoint；或者在数据加载器中混合多个组织并自行扩展训练逻辑。
+### 6.2 多组织共享模式：`--tissue-config`
+
+如果希望“训练阶段就让模型同时看到多个组织”，从而只保存一份 FiLM checkpoint，在 Variant 阶段通过更换条件向量实现 double-run，可以提供一个 JSON 配置列举所有组织的 HDF5 与特征：
+
+```json
+[
+  {
+    "name": "blood",
+    "train_dataset": "/path/blood/dataset_train.h5",
+    "valid_dataset": "/path/blood/dataset_validation.h5",
+    "test_dataset":  "/path/blood/dataset_test.h5",
+    "rbp_expression": "data/blood_features.json"
+  },
+  {
+    "name": "neuron",
+    "train_dataset": "/path/neuron/dataset_train.h5",
+    "valid_dataset": "/path/neuron/dataset_validation.h5",
+    "test_dataset":  "/path/neuron/dataset_test.h5",
+    "rbp_expression": "data/neuron_features.json"
+  }
+]
+```
+
+命令示例：
+
+```bash
+openspliceai transfer \
+  --tissue-config config/tissues.json \
+  --pretrained-model runs/base_model/model_best.pt \
+  --flanking-size 10000 \
+  --epochs 5 \
+  --unfreeze 4 \
+  --output-dir runs/shared_film \
+  --project-name shared_film
+```
+
+注意事项：
+
+- `--tissue-config` 与 `--rbp-expression` 互斥；前者表示一次性加载多个组织，每个组织都需要 train/valid/test HDF5。
+- 配置中的所有 `rbp_expression` 向量必须维度一致、列名顺序相同（脚本会自动校验）。
+- 训练过程中 dataloader 会混合不同组织的 batch，FiLM γ/β 由同一侧支 MLP 生成，但使用对应组织的向量。
+- 训练完成后，Variant 阶段只需要这一份模型：运行多次 `openspliceai variant`，更换 `--rbp-expression` 指向 blood/neuron 等向量，即可得到可比较的组织特异预测。
+- 多组织模式下不再自动缩放 batch_size，仍用单组织基准批量（flanking=400 默认每卡 18×GPU 数）。梯度累积步数默认为组织数。若显存吃紧，可手动调低基准批量或 `--unfreeze`。
 
 ---
 
@@ -162,7 +207,7 @@ openspliceai variant \
   --output results/annotated_limb.vcf \
   --model runs/limb_film/model_best.pt \
   --ref-genome data/genome.fa \
-  --annotation data/grch38.txt \
+  --annotation data/grch38_chr.txt \
   --flanking-size 10000 \
   --rbp-expression data/limb_features.json
 ```
@@ -170,7 +215,7 @@ openspliceai variant \
 **注意**：
 
 - 若 checkpoint 包含 FiLM/条件元数据，`variant` 会检查输入向量维度与名称；缺失或顺序错误会直接报错，避免预测偏差。
-- 可以多次运行 `variant`，在不同组织模型之间比较 delta 分数，评估组织特异性的剪接影响。
+- 多组织共享模型只需运行 `variant` 多次，替换 `--rbp-expression` 即可输出 blood/neuron 等结果；由于 checkpoint 相同，分数直接可比。
 
 ---
 
@@ -208,7 +253,7 @@ OpenSpliceAI/
    - 将任意组织级别特征（如 RBP TPM、高变基因表达、UMAP 坐标等）拼成 CSV，行名与 `tissue_rbp_matrix.csv` 保持一致，再传给 `--hvg-matrix` 或直接替换原矩阵。`prepare_rbp_expression` 会自动拼接、标准化。
 
 3. **一次训练能覆盖多个组织吗？**  
-   - 当前 CLI 默认一个组织一个 checkpoint。若想在同一模型中混合多个组织，需要自定义 dataloader，使每个 batch 附带对应的向量，再修改 `train_model` 传入不同的 `rbp_batch`。这是更复杂的改动，建议验证单组织流程后再尝试。
+   - 可以，使用 `--tissue-config` 提供多个组织的 train/valid/test HDF5 与各自表达向量，`transfer` 会混合训练并共享同一 FiLM 侧支（详见 6.2）。
 
 4. **Variant 结果如何解释？**  
    - `variant` 输出与官方 SpliceAI 相同的 delta scores（ΔAG、ΔAL、ΔDG、ΔDL）及位置偏移，可直接用于筛选可能影响剪接的突变。若对多个组织运行，可比较不同组织的分数差异。

@@ -217,7 +217,7 @@ class Annotator:
     It initializes with the reference genome, annotation data, and optional model configuration.
     """
     
-    def __init__(self, ref_fasta, annotations, model_path='SpliceAI', model_type='keras', CL=80, rbp_tensor=None):
+    def __init__(self, ref_fasta, annotations, model_path='SpliceAI', model_type='keras', CL=80, rbp_context=None, rbp_tensor=None):
         """
         Initializes the Annotator with reference genome, annotations, and model settings.
         
@@ -265,6 +265,11 @@ class Annotator:
             exit()  # Exit if the file cannot be read
 
         # Load models based on the specified model type or file
+        # Unified RBP context container: {"tensor": Tensor, "names": [str] | None}
+        if rbp_context is None:
+            rbp_context = {"tensor": rbp_tensor, "names": None}
+        elif torch.is_tensor(rbp_context):
+            rbp_context = {"tensor": rbp_context, "names": None}
         self.rbp_tensor = None
         if model_path == 'SpliceAI':
             from tensorflow import keras
@@ -282,15 +287,16 @@ class Annotator:
             exit()
         
         print(f'\t[INFO] {len(self.models)} model(s) loaded successfully')
-        self._maybe_prepare_rbp_condition(rbp_tensor)
+        self._maybe_prepare_rbp_condition(rbp_context)
 
-    def _maybe_prepare_rbp_condition(self, rbp_tensor):
+    def _maybe_prepare_rbp_condition(self, rbp_context):
         if getattr(self, "keras", False):
-            if rbp_tensor is not None:
+            if rbp_context and rbp_context.get("tensor") is not None:
                 logging.warning("RBP expression provided but current backend does not use FiLM; ignoring.")
             self.rbp_tensor = None
             return
         film_dims = set()
+        film_names = None
         for model in self.models:
             metadata = {}
             if hasattr(model, "rbp_metadata"):
@@ -298,17 +304,19 @@ class Annotator:
             dim = metadata.get("rbp_dim")
             if dim:
                 film_dims.add(dim)
+            if film_names is None:
+                film_names = metadata.get("rbp_names")
         if not film_dims:
-            if rbp_tensor is not None:
+            if rbp_context and rbp_context.get("tensor") is not None:
                 logging.warning("RBP expression provided but loaded model lacks FiLM layers; ignoring vector.")
             self.rbp_tensor = None
             return
-        if rbp_tensor is None:
+        if rbp_context is None or rbp_context.get("tensor") is None:
             raise ValueError("Model contains FiLM layers; please provide --rbp-expression.")
         if len(film_dims) > 1:
             raise ValueError(f"Inconsistent FiLM dimensions detected: {sorted(film_dims)}")
         required_dim = film_dims.pop()
-        tensor = rbp_tensor
+        tensor = rbp_context.get("tensor")
         if not torch.is_tensor(tensor):
             tensor = torch.tensor(tensor, dtype=torch.float32)
         tensor = tensor.to(dtype=torch.float32)
@@ -316,6 +324,11 @@ class Annotator:
             tensor = tensor.unsqueeze(0)
         if tensor.shape[-1] != required_dim:
             raise ValueError(f"RBP vector dimension ({tensor.shape[-1]}) does not match model requirement ({required_dim}).")
+        provided_names = rbp_context.get("names") or []
+        if film_names and provided_names and film_names != provided_names:
+            raise ValueError("RBP feature ordering mismatch between model checkpoint and provided vector.")
+        if film_names and not provided_names:
+            logging.warning("Model expects ordered RBP features, but provided vector has no names; ensure the ordering matches training.")
         device = next(self.models[0].parameters()).device
         self.rbp_tensor = tensor.to(device)
 

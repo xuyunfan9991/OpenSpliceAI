@@ -180,12 +180,20 @@ def focal_loss(y_true, y_pred, alpha=0.25, gamma=2.0):
     Returns:
     - loss: computed focal loss.
     """
-    # Ensuring numerical stability
-    gamma = 2
     epsilon = 1e-10
-    return - torch.mean(y_true[:, 0, :]*torch.log(y_pred[:, 0, :]+epsilon) * torch.pow(torch.sub(1, y_pred[:, 0, :]), gamma)
-                        + y_true[:, 1, :]*torch.log(y_pred[:, 1, :]+epsilon) * torch.pow(torch.sub(1, y_pred[:, 1, :]), gamma)
-                        + y_true[:, 2, :]*torch.log(y_pred[:, 2, :]+epsilon) * torch.pow(torch.sub(1, y_pred[:, 2, :]), gamma))
+    y_pred = torch.clamp(y_pred, epsilon, 1. - epsilon)
+
+    if isinstance(alpha, (list, tuple)):
+        alpha_tensor = y_pred.new_tensor(alpha, dtype=y_pred.dtype)
+    elif torch.is_tensor(alpha):
+        alpha_tensor = alpha.to(dtype=y_pred.dtype, device=y_pred.device)
+    else:
+        alpha_tensor = y_pred.new_full((y_pred.shape[1],), float(alpha), dtype=y_pred.dtype)
+    alpha_tensor = alpha_tensor.view(1, -1, 1)
+
+    weight = torch.pow(1 - y_pred, gamma)
+    loss = -alpha_tensor * y_true * weight * torch.log(y_pred)
+    return loss.sum(dim=1).mean()
 
 
     # return - torch.mean(y_true[:, 0, :] * torch.pow(torch.sub(1, y_pred[:, 0, :]), gamma) * torch.log(y_pred[:, 0, :]+epsilon)
@@ -206,4 +214,3 @@ def focal_loss(y_true, y_pred, alpha=0.25, gamma=2.0):
     # loss = alpha * torch.pow(1 - y_pred, gamma) * cross_entropy
     # # Return the mean loss
     # return torch.mean(loss)
-

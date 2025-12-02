@@ -12,6 +12,7 @@ import os
 import time
 import numpy as np
 import torch
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 from sklearn.metrics import average_precision_score, precision_recall_fscore_support, accuracy_score
@@ -57,15 +58,16 @@ def generate_test_indices(random_seed, test_h5f):
 
 def clip_datapoints_spliceai27(X, Y, CL, N_GPUS):
     rem = X.shape[0]%N_GPUS
-    clip = (CL_max-CL)//2
-    if rem != 0 and clip != 0:
-        return X[:-rem, clip:-clip], [Y[t][:-rem] for t in range(1)]
-    elif rem == 0 and clip != 0:
-        return X[:, clip:-clip], [Y[t] for t in range(1)]
-    elif rem != 0 and clip == 0:
-        return X[:-rem], [Y[t][:-rem] for t in range(1)]
-    else:
-        return X, [Y[t] for t in range(1)]
+    dataset_cl = X.shape[1] - SL
+    clip_total = max(0, dataset_cl - CL)
+    clip_left = clip_total // 2
+    clip_right = clip_total - clip_left
+    if rem != 0:
+        X = X[:-rem]
+        Y = [Y[t][:-rem] for t in range(1)]
+    if clip_total > 0:
+        X = X[:, clip_left:-clip_right] if clip_right > 0 else X[:, clip_left:]
+    return X, [Y[t] for t in range(1)]
 
 
 class MetricsAccumulator:
@@ -346,9 +348,11 @@ def metrics(batch_ypred, batch_ylabel, metric_files, run_mode):
                     f.write(f"{acc}\n")
 
 
-def model_evaluation(batch_ylabel, batch_ypred, metric_files, run_mode, criterion):
+def model_evaluation(batch_ylabel, batch_ypred, metric_files, run_mode, criterion, loss_override=None):
     batch_ylabel = torch.cat(batch_ylabel, dim=0)
     batch_ypred = torch.cat(batch_ypred, dim=0)
+    device = batch_ypred.device
+    loss = torch.tensor(0.0, device=device) if loss_override is None else loss_override
     is_expr = (batch_ylabel.sum(axis=(1,2)) >= 1).cpu().numpy()
     if np.any(is_expr):
         subset_size = 1000
@@ -364,10 +368,11 @@ def model_evaluation(batch_ylabel, batch_ypred, metric_files, run_mode, criterio
                             np.asarray(Y_pred_1), metric_files["acceptor_topk_all"], ss_type='acceptor', print_top_k=True)
         donor_topk_accuracy, donor_auprc = print_topl_statistics(np.asarray(Y_true_2),
                             np.asarray(Y_pred_2), metric_files["donor_topk_all"], ss_type='donor', print_top_k=True)
-        if criterion == "cross_entropy_loss":
-            loss = categorical_crossentropy_2d(batch_ylabel, batch_ypred)
-        elif criterion == "focal_loss":
-            loss = focal_loss(batch_ylabel, batch_ypred)
+        if loss_override is None:
+            if criterion == "cross_entropy_loss":
+                loss = categorical_crossentropy_2d(batch_ylabel, batch_ypred)
+            elif criterion == "focal_loss":
+                loss = focal_loss(batch_ylabel, batch_ypred)
         for k, v in metric_files.items():
             with open(v, 'a') as f:
                 if k == "loss_batch":
@@ -421,8 +426,10 @@ def valid_epoch(model, h5f, idxs, batch_size, criterion, device, params, metric_
             pbar.update(1)
             batch_idx += 1
         pbar.close()
-    eval_loss = model_evaluation(batch_ylabel, batch_ypred, metric_files, run_mode, criterion)
-    return eval_loss
+    # Use full-dataset average loss for early stopping / scheduler
+    mean_loss = torch.tensor(running_loss / max(1, batch_idx), device=device)
+    eval_loss = model_evaluation(batch_ylabel, batch_ypred, metric_files, run_mode, criterion, loss_override=mean_loss)
+    return mean_loss
 
 
 def train_epoch(model, h5f, idxs, batch_size, criterion, optimizer, scheduler, device, params, metric_files, flanking_size, run_mode, global_batch_idx, rbp_context=None):
@@ -442,6 +449,8 @@ def train_epoch(model, h5f, idxs, batch_size, criterion, optimizer, scheduler, d
         # Load the loader to get its length
         loader = load_data_from_shard(h5f, shard_idx, device, batch_size, params, shuffle=False)
         total_batches_in_epoch += len(loader)
+
+    is_plateau_scheduler = isinstance(scheduler, ReduceLROnPlateau)
 
     for i, shard_idx in enumerate(shuffled_idxs, 1):
         print(f"Shard {i}/{len(shuffled_idxs)}")
@@ -468,18 +477,24 @@ def train_epoch(model, h5f, idxs, batch_size, criterion, optimizer, scheduler, d
             pbar.set_postfix(print_dict)
             pbar.update(1)
 
-            # Update the scheduler
-            epoch_fraction = global_batch_idx / total_batches_in_epoch
-            scheduler.step(epoch_fraction)
-            # Log current learning rate
-            current_lr = scheduler.get_last_lr()[0]
-            print_dict["lr"] = f"{current_lr:.6e}"        
+            # Update the scheduler (plateau schedulers are stepped per-epoch with val loss)
+            if scheduler is not None and not is_plateau_scheduler:
+                epoch_fraction = global_batch_idx / total_batches_in_epoch
+                scheduler.step(epoch_fraction)
+                current_lr = scheduler.get_last_lr()[0]
+                with open(metric_files['learning_rate_every_batch'], 'a') as f:
+                    f.write(f"{current_lr}\n")
+            else:
+                current_lr = optimizer.param_groups[0]['lr']
+                if scheduler is not None:  # log constant LR for plateau scheduler
+                    with open(metric_files['learning_rate_every_batch'], 'a') as f:
+                        f.write(f"{current_lr}\n")
+            print_dict["lr"] = f"{current_lr:.6e}"
             global_batch_idx += 1  # Increment global batch index
-            with open(metric_files['learning_rate_every_batch'], 'a') as f:
-                f.write(f"{current_lr}\n")
         pbar.close()
-    eval_loss = model_evaluation(batch_ylabel, batch_ypred, metric_files, run_mode, criterion)
-    return eval_loss, global_batch_idx
+    mean_loss = torch.tensor(running_loss / max(1, total_batches_in_epoch), device=device)
+    model_evaluation(batch_ylabel, batch_ypred, metric_files, run_mode, criterion, loss_override=mean_loss)
+    return mean_loss, global_batch_idx
 
 
 def calculate_metrics(y_true, y_pred):
@@ -494,20 +509,32 @@ def threshold_predictions(y_probs, threshold=0.5):
     return (y_probs > threshold).astype(int)
 
 
-def clip_datapoints(X, Y, CL, CL_max, N_GPUS):
+def clip_datapoints(X, Y, CL, CL_window=None, N_GPUS=1):
     """
-    Clip the input data points to the desired length.
+    Clip the input data points to the desired context length (CL).
+    If a larger context window was stored in the dataset, trim it symmetrically.
     """
-    rem = X.shape[0]%N_GPUS
-    clip = (CL_max-CL)//2
-    if rem != 0 and clip != 0:
-        return X[:-rem, :, clip:-clip], Y[:-rem]
-    elif rem == 0 and clip != 0:
-        return X[:, :, clip:-clip], Y
-    elif rem != 0 and clip == 0:
-        return X[:-rem], Y[:-rem]
-    else:
-        return X, Y
+    # Infer stored context length directly from tensor shape to stay aligned with dataset generation.
+    dataset_cl = X.shape[2] - SL
+    effective_cl = dataset_cl
+    if CL_window is not None and CL_window != dataset_cl:
+        # Prefer the true dataset context to avoid negative or excessive clipping.
+        effective_cl = dataset_cl
+    if CL > effective_cl:
+        raise ValueError(f"Requested context {CL} exceeds dataset context {effective_cl}. "
+                         "Please regenerate data with a larger --flanking-size or use a smaller CL.")
+    clip_total = max(0, effective_cl - CL)
+    # Enforce symmetric trimming; if odd, drop the extra base on the right.
+    clip_left = clip_total // 2
+    clip_right = clip_total - clip_left
+
+    rem = X.shape[0] % N_GPUS
+    if rem != 0:
+        X = X[:-rem]
+        Y = Y[:-rem]
+    if clip_total > 0:
+        X = X[:, :, clip_left:-clip_right] if clip_right > 0 else X[:, :, clip_left:]
+    return X, Y
 
 
 def print_topl_statistics(y_true, y_pred, file, ss_type='acceptor', print_top_k=False):
@@ -566,12 +593,21 @@ def focal_loss(y_true, y_pred, alpha=0.25, gamma=2.0):
     """
     Compute 2D focal loss.
     """
-    # Ensuring numerical stability
-    gamma = 2
     epsilon = 1e-10
-    return - torch.mean(y_true[:, 0, :]*torch.log(y_pred[:, 0, :]+epsilon) * torch.pow(torch.sub(1, y_pred[:, 0, :]), gamma)
-                        + y_true[:, 1, :]*torch.log(y_pred[:, 1, :]+epsilon) * torch.pow(torch.sub(1, y_pred[:, 1, :]), gamma)
-                        + y_true[:, 2, :]*torch.log(y_pred[:, 2, :]+epsilon) * torch.pow(torch.sub(1, y_pred[:, 2, :]), gamma))
+    y_pred = torch.clamp(y_pred, epsilon, 1. - epsilon)
+
+    # Allow alpha to be scalar or class-wise iterable/tensor.
+    if isinstance(alpha, (list, tuple)):
+        alpha_tensor = y_pred.new_tensor(alpha, dtype=y_pred.dtype)
+    elif torch.is_tensor(alpha):
+        alpha_tensor = alpha.to(dtype=y_pred.dtype, device=y_pred.device)
+    else:
+        alpha_tensor = y_pred.new_full((y_pred.shape[1],), float(alpha), dtype=y_pred.dtype)
+    alpha_tensor = alpha_tensor.view(1, -1, 1)
+
+    weight = torch.pow(1 - y_pred, gamma)
+    loss = -alpha_tensor * y_true * weight * torch.log(y_pred)
+    return loss.sum(dim=1).mean()
 
 
 def train_model(model, optimizer, scheduler, train_h5f, valid_h5f, test_h5f, train_idxs, val_idxs, test_idxs,
@@ -586,6 +622,8 @@ def train_model(model, optimizer, scheduler, train_h5f, valid_h5f, test_h5f, tra
     rbp_context_tensor = None
     if rbp_context is not None:
         rbp_context_tensor = rbp_context.to(device)
+    is_plateau_scheduler = isinstance(scheduler, ReduceLROnPlateau)
+
     for epoch in range(args.epochs):
         print(f"\n{'='*60}")
         # current_lr = optimizer.param_groups[0]['lr']
@@ -599,6 +637,8 @@ def train_model(model, optimizer, scheduler, train_h5f, valid_h5f, test_h5f, tra
                                params, valid_metric_files, args.flanking_size, "validation", rbp_context=rbp_context_tensor)
         test_loss = valid_epoch(model, test_h5f, test_idxs, params["BATCH_SIZE"], args.loss, device,
                                 params, test_metric_files, args.flanking_size, "test", rbp_context=rbp_context_tensor)
+        if scheduler is not None and is_plateau_scheduler:
+            scheduler.step(val_loss.item())
         print(f"Training Loss: {train_loss}")
         print(f"Validation Loss: {val_loss}")
         print(f"Testing Loss: {test_loss}")
@@ -620,9 +660,10 @@ def train_model(model, optimizer, scheduler, train_h5f, valid_h5f, test_h5f, tra
                 best_val_loss = val_loss.item()
                 torch.save(model.state_dict(), f"{model_output_base}/model_best.pt")
                 print("New best model saved.")
-        current_lr = scheduler.get_last_lr()[0]
-        with open(train_metric_files['learning_rate_every_epoch'], 'a') as f:
-            f.write(f"{current_lr}\n")
+        if scheduler is not None:
+            current_lr = scheduler.get_last_lr()[0]
+            with open(train_metric_files['learning_rate_every_epoch'], 'a') as f:
+                f.write(f"{current_lr}\n")
         print(f">> Epoch {epoch + 1}; Final Learning Rate: {current_lr}")
         print(f"--- {time.time() - start_time:.2f} seconds ---")
         print("="*60)

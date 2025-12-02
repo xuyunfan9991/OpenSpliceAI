@@ -5,24 +5,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from openspliceai.rbp.metadata import (
-    decode_rbp_metadata,
-    encode_rbp_metadata,
-)
+from openspliceai.rbp.metadata import decode_rbp_metadata, encode_rbp_metadata
 
 
-class FiLMLayer(nn.Module):
-    """Feature-wise Linear Modulation conditioned on RBP vectors."""
+class ExpressionFiLM(nn.Module):
+    """Side MLP that produces FiLM gamma/beta from expression vectors."""
 
-    def __init__(self, channels: int, rbp_dim: int):
+    def __init__(
+        self, channels: int, rbp_dim: int, hidden: int = 128, dropout: float = 0.2, noise_std: float = 0.05
+    ):
         super().__init__()
-        self.affine = nn.Linear(rbp_dim, channels * 2)
+        self.affine = nn.Sequential(
+            nn.Linear(rbp_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, channels * 2),
+        )
+        # Small normal init so gamma/beta start with mild variation instead of strict identity
+        nn.init.normal_(self.affine[-1].weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.affine[-1].bias, mean=0.0, std=0.02)
         self.channels = channels
+        self.noise_std = noise_std
 
-    def forward(self, rbp_batch):
+    def forward(self, rbp_batch: torch.Tensor):
+        if self.training and self.noise_std > 0:
+            rbp_batch = rbp_batch + torch.randn_like(rbp_batch) * self.noise_std
         gamma_beta = self.affine(rbp_batch)
         gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
-        # reshape for broadcasting across sequence length
+        gamma = 1.0 + gamma
         gamma = gamma.unsqueeze(-1)
         beta = beta.unsqueeze(-1)
         return gamma, beta
@@ -37,14 +48,10 @@ class ResidualUnit(nn.Module):
         self.relu2 = nn.LeakyReLU(0.1)
         self.conv1 = nn.Conv1d(l, l, w, dilation=ar, padding=(w-1)*ar//2)
         self.conv2 = nn.Conv1d(l, l, w, dilation=ar, padding=(w-1)*ar//2)
-        self.film = FiLMLayer(l, film_dim) if film_dim else None
 
     def forward(self, x, y, rbp_batch=None):
         out = self.conv1(self.relu1(self.batchnorm1(x)))
         out = self.conv2(self.relu2(self.batchnorm2(out)))
-        if self.film is not None and rbp_batch is not None:
-            gamma, beta = self.film(rbp_batch)
-            out = gamma * out + beta
         return x + out, y
 
 
@@ -76,15 +83,20 @@ class SpliceAI(nn.Module):
         self.film_enabled = bool(self.film_config)
         self._warned_missing_rbp = False
         self.residual_units = nn.ModuleList()
-        residual_idx = 0
         for i, (w, r) in enumerate(zip(W, AR)):
-            film_dim = None
-            if self.film_enabled and residual_idx >= self.film_config["film_start"]:
-                film_dim = self.film_config["rbp_dim"]
-            self.residual_units.append(ResidualUnit(L, w, r, film_dim=film_dim))
-            residual_idx += 1
+            self.residual_units.append(ResidualUnit(L, w, r, film_dim=None))
             if (i+1) % 4 == 0:
                 self.residual_units.append(Skip(L))
+        self.expression_film = None
+        if self.film_enabled:
+            noise_std = self.film_config.get("film_noise_std", 0.05)
+            self.expression_film = ExpressionFiLM(
+                channels=L,
+                rbp_dim=self.film_config["rbp_dim"],
+                hidden=self.film_config.get("film_hidden", 128),
+                dropout=self.film_config.get("film_dropout", 0.2),
+                noise_std=noise_std,
+            )
         self.final_conv = nn.Conv1d(L, 3, 1)
         self.CL = 2 * np.sum(AR * (W - 1))
         self.crop = Cropping1D((self.CL//2, self.CL//2))
@@ -93,7 +105,11 @@ class SpliceAI(nn.Module):
             metadata = {
                 "rbp_dim": self.film_config["rbp_dim"],
                 "rbp_names": self.film_config.get("rbp_names"),
-                "film_start": self.film_config["film_start"],
+                "film_start": self.film_config.get("film_start", 0),
+                "film_hidden": self.film_config.get("film_hidden", 128),
+                "film_dropout": self.film_config.get("film_dropout", 0.2),
+                "film_noise_std": noise_std,
+                "film_mode": "global_tail",
             }
         self.register_buffer("_rbp_metadata_blob", encode_rbp_metadata(metadata))
 
@@ -102,14 +118,13 @@ class SpliceAI(nn.Module):
             return {}
         if "rbp_dim" not in film_config:
             raise ValueError("film_config requires 'rbp_dim'.")
-        start = film_config.get("film_start")
-        if start is None:
-            start = num_residual_units // 2
-        if start < 0 or start >= num_residual_units:
-            raise ValueError(f"film_start {start} outside valid range (0-{num_residual_units-1}).")
         normalized = dict(film_config)
-        normalized["film_start"] = int(start)
         normalized["rbp_dim"] = int(film_config["rbp_dim"])
+        if "film_hidden" in normalized:
+            normalized["film_hidden"] = int(normalized["film_hidden"])
+        if "film_dropout" in normalized:
+            normalized["film_dropout"] = float(normalized["film_dropout"])
+        normalized["film_noise_std"] = float(normalized.get("film_noise_std", 0.05))
         return normalized
 
     def rbp_metadata(self):
@@ -151,10 +166,13 @@ class SpliceAI(nn.Module):
         x, skip = self.initial_skip(x, 0)
         for m in self.residual_units:
             if isinstance(m, ResidualUnit):
-                x, skip = m(x, skip, rbp_batch)
+                x, skip = m(x, skip, None)
             else:
                 x, skip = m(x, skip)
         final_x = self.crop(skip)
+        if self.expression_film is not None and rbp_batch is not None:
+            gamma, beta = self.expression_film(rbp_batch)
+            final_x = gamma * final_x + beta
         out = self.final_conv(final_x)
         if self.apply_softmax:
             return F.softmax(out, dim=1)

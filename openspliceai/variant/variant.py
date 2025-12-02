@@ -51,11 +51,12 @@ def variant(args):
           distance: {distance}, mask: {mask}, flanking_size: {flanking_size}, precision: {precision}''')
 
     # Load optional RBP expression vector
-    rbp_tensor = None
+    rbp_context = None
     if args.rbp_expression:
         try:
             rbp_expr = load_rbp_expression(args.rbp_expression)
             rbp_tensor = torch.tensor(rbp_expr.values, dtype=torch.float32).unsqueeze(0)
+            rbp_context = {"tensor": rbp_tensor, "names": rbp_expr.names}
             logging.info(f"Loaded RBP vector dim={rbp_expr.dim} from {args.rbp_expression}")
         except (OSError, ValueError) as exc:
             logging.error(f"Failed to read RBP expression vector: {exc}")
@@ -88,7 +89,7 @@ def variant(args):
     # Setup the Annotator based on reference genome and annotation
     logging.info('Initializing Annotator class')
     try:
-        ann = Annotator(ref_genome, annotation, model, model_type, flanking_size, rbp_tensor=rbp_tensor)
+        ann = Annotator(ref_genome, annotation, model, model_type, flanking_size, rbp_context=rbp_context)
     except ValueError as exc:
         logging.error(f"Annotator initialisation failed: {exc}")
         exit(1)
