@@ -59,6 +59,9 @@ def initialize_model_and_optim(device, flanking_size, epochs, scheduler):
     elif scheduler == "CosineAnnealingWarmRestarts":
         scheduler_obj = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=5, T_mult=1, eta_min=1e-5, last_epoch=-1)    
+    elif scheduler == "ReduceLROnPlateau":
+        scheduler_obj = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=2, verbose=True)
     params = {'L': L, 'W': W, 'AR': AR, 'CL': CL, 'SL': SL, 'BATCH_SIZE': BATCH_SIZE, 'N_GPUS': N_GPUS}
     return model, optimizer, scheduler_obj, params
 

@@ -15,6 +15,7 @@ from openspliceai.calibrate import calibrate
 from openspliceai.transfer import transfer
 from openspliceai.predict import predict
 from openspliceai.variant import variant
+from openspliceai.train_base import utils as train_utils
 
 __VERSION__ = header.__version__
 
@@ -41,7 +42,7 @@ def parse_args_create_data(subparsers):
 def parse_args_train(subparsers):
     parser_train = subparsers.add_parser('train', help='Train the SpliceAI model')
     parser_train.add_argument('--epochs', '-n', type=int, default=10, help='Number of epochs for training')
-    parser_train.add_argument('--scheduler', '-s', type=str, default="MultiStepLR", choices=["MultiStepLR", "CosineAnnealingWarmRestarts"], help="Learning rate scheduler")
+    parser_train.add_argument('--scheduler', '-s', type=str, default="MultiStepLR", choices=["MultiStepLR", "CosineAnnealingWarmRestarts", "ReduceLROnPlateau"], help="Learning rate scheduler")
     parser_train.add_argument('--early-stopping', '-E', action='store_true', default=False, help='Enable early stopping')
     parser_train.add_argument("--patience", '-P', type=int, default=2, help="Number of epochs to wait before early stopping")
     parser_train.add_argument('--output-dir', '-o', type=str, required=True, help='Output directory to save the data')
@@ -53,6 +54,8 @@ def parse_args_train(subparsers):
     parser_train.add_argument('--test-dataset', '-test', type=str, required=True, help="Path to the testing dataset")
     parser_train.add_argument("--loss", '-l', type=str, default='cross_entropy_loss', choices=["cross_entropy_loss", "focal_loss"], help="Loss function for training")
     parser_train.add_argument('--model', '-m', default="SpliceAI", type=str)
+    parser_train.add_argument("--focal-alpha", nargs='+', type=float, help="Class-wise alpha for focal loss (scalar or per-class list)")
+    parser_train.add_argument("--focal-gamma", type=float, help="Gamma for focal loss")
 
 
 def parse_args_test(subparsers):
@@ -67,6 +70,8 @@ def parse_args_test(subparsers):
     parser_test.add_argument("--loss", '-l', type=str, default='cross_entropy_loss', choices=["cross_entropy_loss", "focal_loss"], help="Loss function for training")
     parser_test.add_argument('--test-target', '-t', default="OpenSpliceAI", choices=["OpenSpliceAI", "SpliceAI-Keras"], type=str)
     parser_test.add_argument('--log-dir', '-L', default="TEST_LOG", type=str)
+    parser_test.add_argument("--focal-alpha", nargs='+', type=float, help="Class-wise alpha for focal loss (scalar or per-class list)")
+    parser_test.add_argument("--focal-gamma", type=float, help="Gamma for focal loss")
 
 
 def parse_args_calibrate(subparsers):
@@ -84,12 +89,16 @@ def parse_args_calibrate(subparsers):
     parser_calibrate.add_argument("--train-dataset", '-train', type=str, required=True, help="Path to the training dataset")
     parser_calibrate.add_argument("--test-dataset", '-test', type=str, required=True, help="Path to the testing dataset")
     parser_calibrate.add_argument("--loss", '-l', type=str, default='cross_entropy_loss', choices=["cross_entropy_loss", "focal_loss"], help="Loss function for fine-tuning")
+    parser_calibrate.add_argument("--focal-alpha", nargs='+', type=float, help="Class-wise alpha for focal loss (scalar or per-class list)")
+    parser_calibrate.add_argument("--focal-gamma", type=float, help="Gamma for focal loss")
 
 
 def parse_args_transfer(subparsers):
     parser_transfer = subparsers.add_parser('transfer', help='transfer a pre-trained SpliceAI model on new data.')
     parser_transfer.add_argument('--epochs', '-n', type=int, default=10, help='Number of epochs for training')
-    parser_transfer.add_argument('--scheduler', '-s', type=str, default="MultiStepLR", choices=["MultiStepLR", "CosineAnnealingWarmRestarts"], help="Learning rate scheduler")
+    parser_transfer.add_argument('--scheduler', '-s', type=str, default="MultiStepLR", choices=["MultiStepLR", "CosineAnnealingWarmRestarts", "ReduceLROnPlateau"], help="Learning rate scheduler")
+    parser_transfer.add_argument("--lr", type=float, default=1e-4, help="Base learning rate for fine-tuning (AdamW)")
+    parser_transfer.add_argument("--film-lr-mult", type=float, default=1.0, help="Multiplier applied to FiLM branch learning rate")
     parser_transfer.add_argument('--early-stopping', '-E', action='store_true', default=False, help='Enable early stopping')
     parser_transfer.add_argument("--patience", '-P', type=int, default=2, help="Number of epochs to wait before early stopping")
     parser_transfer.add_argument("--output-dir", '-o', type=str, required=True, help="Output directory for model checkpoints and logs")
@@ -98,11 +107,18 @@ def parse_args_transfer(subparsers):
     parser_transfer.add_argument("--flanking-size", '-f', type=int, default=80, choices=[80, 400, 2000, 10000], help="Flanking sequence size")
     parser_transfer.add_argument("--random-seed", '-r', type=int, default=42, help="Random seed for reproducibility")
     parser_transfer.add_argument("--pretrained-model", '-m', type=str, required=True, help="Path to the pre-trained model")
-    parser_transfer.add_argument("--train-dataset", '-train', type=str, required=True, help="Path to the training dataset")
-    parser_transfer.add_argument("--test-dataset", '-test', type=str, required=True, help="Path to the testing dataset")
+    parser_transfer.add_argument("--train-dataset", '-train', type=str, help="Path to the training dataset (omit when using --tissue-config)")
+    parser_transfer.add_argument("--test-dataset", '-test', type=str, help="Path to the testing dataset (omit when using --tissue-config)")
     parser_transfer.add_argument("--loss", '-l', type=str, default='cross_entropy_loss', choices=["cross_entropy_loss", "focal_loss"], help="Loss function for fine-tuning")
-    parser_transfer.add_argument("--unfreeze-all", '-A', action='store_true', default=True, help='Unfreeze all layers for fine-tuning')
+    parser_transfer.add_argument("--unfreeze-all", '-A', action='store_true', default=False, help='Unfreeze all layers for fine-tuning')
     parser_transfer.add_argument("--unfreeze", '-u', type=int, default=1, help="Number of layers to unfreeze for fine-tuning")
+    parser_transfer.add_argument('--rbp-expression', type=str, help='Path to an RBP expression vector (JSON/NPY) used for FiLM conditioning')
+    parser_transfer.add_argument('--film-start-layer', type=int, default=None, help='1-based residual unit index to start FiLM conditioning (defaults to half of the network)')
+    parser_transfer.add_argument('--tissue-config', type=str,
+                                 help='Optional JSON describing multiple tissues (train/valid/test datasets + RBP vectors) for joint FiLM training.')
+    parser_transfer.add_argument('--nofilm', action='store_true', help='Disable FiLM conditioning even if expression vectors are provided.')
+    parser_transfer.add_argument("--focal-alpha", nargs='+', type=float, help="Class-wise alpha for focal loss (scalar or per-class list)")
+    parser_transfer.add_argument("--focal-gamma", type=float, help="Gamma for focal loss")
 
 
 def parse_args_predict(subparsers):
@@ -110,6 +126,7 @@ def parse_args_predict(subparsers):
     parser_predict.add_argument('--input-sequence', '-i', type=str, required=True, help="Path to FASTA file of the input sequence")
     parser_predict.add_argument('--model', '-m', type=str, required=True, help='Path to a PyTorch SpliceAI model file')
     parser_predict.add_argument('--flanking-size', '-f', type=int, required=True, help='Sum of flanking sequence lengths on each side of input (i.e. 40+40)')
+    parser_predict.add_argument('--rbp-expression', type=str, help='Path to an RBP expression vector (JSON/NPY) used when the model includes FiLM layers')
     parser_predict.add_argument('--output-dir', '-o', type=str, default="./predict_out", help='Output directory to save the data')
     parser_predict.add_argument('--annotation-file', '-a', type=str, required=False, help="Path to GFF file of coordinates for genes")
     parser_predict.add_argument('--threshold', '-t', type=float, default=1e-6, help="Threshold to determine acceptor and donor sites")
@@ -141,6 +158,7 @@ def parse_args_variant(subparsers):
     parser_variant.add_argument('--flanking-size', '-f', type=int, default=80, help='Sum of flanking sequence lengths on each side of input (i.e. 40+40)')
     parser_variant.add_argument('--model-type', '-t', type=str, choices=['keras', 'pytorch'], default='pytorch', help='Type of model file (keras or pytorch)')
     parser_variant.add_argument('--precision', '-p', type=int, default=2, help='Number of decimal places to round the output scores')
+    parser_variant.add_argument('--rbp-expression', type=str, help='Path to an RBP expression vector (JSON/NPY) used when the model includes FiLM layers')
  
 
 def parse_args(arglist):
@@ -179,6 +197,11 @@ Deep learning framework that decodes splicing across species
     print(banner, file=sys.stderr)
     print(f"{__VERSION__}\n", file=sys.stderr)
     args = parse_args(arglist)
+    # Configure focal loss hyperparameters globally (no-op if not provided)
+    train_utils.set_focal_params(
+        alpha=getattr(args, "focal_alpha", None),
+        gamma=getattr(args, "focal_gamma", None),
+    )
     
     if args.command == 'create-data':
         create_datafile.create_datafile(args)
