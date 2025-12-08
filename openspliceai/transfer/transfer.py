@@ -19,9 +19,8 @@ from openspliceai.train_base.utils import *
 
 def initialize_model_and_optim_transfer(device, flanking_size, epochs, scheduler,
                                pretrained_model, unfreeze, unfreeze_all,
-                               rbp_expression_path=None, film_start_layer=None,
-                               disable_film: bool = False, lr: float = 1e-4,
-                               film_lr_mult: float = 1.0):
+                               rbp_expression_path=None, disable_film: bool = False,
+                               lr: float = 1e-4, film_lr_mult: float = 1.0):
     L = 32
     N_GPUS = max(1, torch.cuda.device_count()) if torch.cuda.is_available() else 1
     W = np.asarray([11, 11, 11, 11])
@@ -53,20 +52,11 @@ def initialize_model_and_optim_transfer(device, flanking_size, epochs, scheduler
     # Initialize the model
     film_config = None
     rbp_tensor = None
-    num_residual_units = len(W)
     if rbp_expression_path and not disable_film:
         rbp_expr = load_rbp_expression(rbp_expression_path)
-        start_layer = film_start_layer - 1 if film_start_layer is not None else num_residual_units // 2
-        start_layer = max(0, min(start_layer, num_residual_units - 1))
-        film_config = {
-            "rbp_dim": rbp_expr.dim,
-            "rbp_names": rbp_expr.names,
-            "film_start": start_layer,
-        }
+        film_config = {"rbp_dim": rbp_expr.dim, "rbp_names": rbp_expr.names}
         rbp_tensor = torch.tensor(rbp_expr.values, dtype=torch.float32).unsqueeze(0)
-        print(f"[FiLM] Enabled with dim={rbp_expr.dim}, start_unit={start_layer+1}")
-    elif film_start_layer is not None and not disable_film:
-        print("[FiLM] --film-start-layer ignored because --rbp-expression was not supplied.")
+        print(f"[FiLM] Enabled with dim={rbp_expr.dim} (global tail modulation)")
     else:
         if disable_film:
             print("[FiLM] Disabled via --nofilm; model will run unconditioned.")
@@ -162,8 +152,7 @@ def transfer(args):
     model, optimizer, scheduler, params, rbp_context = initialize_model_and_optim_transfer(
         device, args.flanking_size, args.epochs, args.scheduler, args.pretrained_model,
         args.unfreeze, args.unfreeze_all, rbp_expression_path=args.rbp_expression,
-        film_start_layer=args.film_start_layer, disable_film=args.nofilm,
-        lr=args.lr, film_lr_mult=args.film_lr_mult)
+        disable_film=args.nofilm, lr=args.lr, film_lr_mult=args.film_lr_mult)
     
     params["RANDOM_SEED"] = args.random_seed
     train_metric_files = create_metric_files(log_output_train_base)
@@ -204,8 +193,7 @@ def transfer_multi_tissue(args):
     model, optimizer, scheduler, params, _ = initialize_model_and_optim_transfer(
         device, args.flanking_size, args.epochs, args.scheduler, args.pretrained_model,
         args.unfreeze, args.unfreeze_all, rbp_expression_path=primary_expr_path,
-        film_start_layer=args.film_start_layer, disable_film=args.nofilm,
-        lr=args.lr, film_lr_mult=args.film_lr_mult)
+        disable_film=args.nofilm, lr=args.lr, film_lr_mult=args.film_lr_mult)
     params["RANDOM_SEED"] = args.random_seed
     tissues = load_tissue_entries(tissue_specs, disable_film=args.nofilm)
     print(f"[FiLM][multi] Using batch_size={params['BATCH_SIZE']} per mini-batch; "

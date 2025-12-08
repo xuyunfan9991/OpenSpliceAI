@@ -107,7 +107,6 @@ class SpliceAI(nn.Module):
             metadata = {
                 "rbp_dim": self.film_config["rbp_dim"],
                 "rbp_names": self.film_config.get("rbp_names"),
-                "film_start": self.film_config.get("film_start", 0),
                 "film_hidden": self.film_config.get("film_hidden", 128),
                 "film_dropout": self.film_config.get("film_dropout", 0.2),
                 "film_noise_std": noise_std,

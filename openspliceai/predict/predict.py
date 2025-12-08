@@ -12,6 +12,8 @@ import time
 from pyfaidx import Fasta
 from openspliceai.train_base.openspliceai import SpliceAI
 import openspliceai.predict.utils as utils
+from openspliceai.rbp.expression import load_rbp_expression
+from openspliceai.rbp.metadata import extract_film_config_from_state_dict
     
 ################
 ##   STEP 1   ##
@@ -490,7 +492,7 @@ def load_pytorch_models(model_path, device, SL, CL):
     - loaded_models (list): SpliceAI model(s) loaded with given state.
     """
     
-    def load_model(device, flanking_size):
+    def load_model(device, flanking_size, film_config=None):
         """Loads the given model."""
         # Hyper-parameters:
         # L: Number of convolution kernels
@@ -529,7 +531,7 @@ def load_pytorch_models(model_path, device, SL, CL):
         print(f"\t[INFO] Context nucleotides {CL}")
         print(f"\t[INFO] Sequence length (output): {SL}")
         
-        model = SpliceAI(L, W, AR).to(device)
+        model = SpliceAI(L, W, AR, film_config=film_config or None).to(device)
         params = {'L': L, 'W': W, 'AR': AR, 'CL': CL, 'SL': SL, 'BATCH_SIZE': BATCH_SIZE, 'N_GPUS': N_GPUS}
 
         return model, params
@@ -603,8 +605,13 @@ def load_pytorch_models(model_path, device, SL, CL):
     for state_dict_obj, source_path in models:
         try:
             state_dict, temperature, metadata = _extract_payload(state_dict_obj, os.path.basename(source_path))
-            model, params = load_model(device, CL) # loads new SpliceAI model with correct hyperparams
-            model.load_state_dict(state_dict)      # loads state dict
+            film_config = extract_film_config_from_state_dict(state_dict)
+            model, params = load_model(device, CL, film_config or None) # loads new SpliceAI model with correct hyperparams
+            # Remove _rbp_metadata_blob from state_dict before loading, as it's metadata not a model parameter
+            # and its size may differ due to JSON serialization format differences.
+            # Use strict=False to allow missing keys since model is already initialized correctly from film_config
+            state_dict_to_load = {k: v for k, v in state_dict.items() if k != "_rbp_metadata_blob"}
+            model.load_state_dict(state_dict_to_load, strict=False)      # loads state dict
             if temperature is not None:
                 if not isinstance(temperature, torch.Tensor):
                     temperature = torch.tensor(temperature, dtype=torch.float32)
@@ -624,6 +631,51 @@ def load_pytorch_models(model_path, device, SL, CL):
         exit()
         
     return loaded_models, params # NOTE: returns the last params, assuming all models have the same hyperparameters
+
+
+def prepare_rbp_tensor(models, rbp_expression_path=None):
+    """
+    Load and validate an RBP expression vector against FiLM metadata stored in the model(s).
+    Returns a tensor placed on the model device or None when FiLM is absent.
+    """
+    film_dims = set()
+    film_names = None
+    for model in models:
+        metadata = {}
+        if hasattr(model, "rbp_metadata"):
+            metadata = model.rbp_metadata()
+        dim = metadata.get("rbp_dim")
+        if dim:
+            film_dims.add(dim)
+        if film_names is None:
+            film_names = metadata.get("rbp_names")
+    if rbp_expression_path is None:
+        if film_dims:
+            raise ValueError("Model contains FiLM layers; please provide --rbp-expression.")
+        return None
+
+    expr = load_rbp_expression(rbp_expression_path)
+    tensor = torch.tensor(expr.values, dtype=torch.float32)
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+
+    if not film_dims:
+        print(f"\t[WARN] RBP expression provided but loaded model lacks FiLM layers; ignoring vector.")
+        return None
+    if len(film_dims) > 1:
+        raise ValueError(f"Inconsistent FiLM dimensions detected: {sorted(film_dims)}")
+    required_dim = film_dims.pop()
+    if tensor.shape[-1] != required_dim:
+        raise ValueError(f"RBP vector dimension ({tensor.shape[-1]}) does not match model requirement ({required_dim}).")
+    provided_names = expr.names or []
+    if film_names and provided_names and film_names != provided_names:
+        raise ValueError("RBP feature ordering mismatch between model checkpoint and provided vector.")
+    if film_names and not provided_names:
+        print("\t[WARN] Model expects ordered RBP features, but provided vector has no names; ensure the ordering matches training.")
+    device = next(models[0].parameters()).device
+    tensor = tensor.to(device=device, dtype=torch.float32)
+    print(f"\t[INFO] Loaded RBP vector dim={tensor.shape[-1]} from {rbp_expression_path}")
+    return tensor
 
 
 
@@ -663,7 +715,7 @@ def flush_predictions(predictions, file_path):
             maxshape = (None,) + predictions.shape[1:]
             f.create_dataset('predictions', data=predictions.numpy(), maxshape=maxshape, chunks=True)
 
-def get_prediction(models, dataset_path, device, batch_size, output_dir, flush_predict_threshold=500, debug=False):
+def get_prediction(models, dataset_path, device, batch_size, output_dir, flush_predict_threshold=500, debug=False, rbp_tensor=None):
     """
     Parameters:
     - model (torch.nn.Module): The SpliceAI model to be evaluated.
@@ -726,7 +778,7 @@ def get_prediction(models, dataset_path, device, batch_size, output_dir, flush_p
                 predictions = []
                 for model in models:
                     with torch.no_grad():
-                        logits = model(DNAs)
+                        logits = model(DNAs, rbp_tensor)
                         logits = apply_model_temperature(model, logits)
                     predictions.append(logits.detach().cpu())
                 y_pred = torch.mean(torch.stack(predictions), axis=0)
@@ -777,7 +829,7 @@ def get_prediction(models, dataset_path, device, batch_size, output_dir, flush_p
             predictions = []
             for model in models:
                 with torch.no_grad():
-                    logits = model(DNAs)
+                    logits = model(DNAs, rbp_tensor)
                     logits = apply_model_temperature(model, logits)
                 predictions.append(logits.detach().cpu())
 
@@ -935,7 +987,7 @@ def generate_bed(predict_file, NAME, LEN, output_dir, threshold=1e-6, batch_ypre
 ##   STEP 4o   ##
 #################
 
-def predict_and_write(models, dataset_path, device, batch_size, NAME, LEN, output_dir, threshold=1e-6, debug=False):
+def predict_and_write(models, dataset_path, device, batch_size, NAME, LEN, output_dir, threshold=1e-6, debug=False, rbp_tensor=None):
     # define batch_size
     print(f'\t[INFO] Batch size: {batch_size}')
     if debug:
@@ -993,7 +1045,7 @@ def predict_and_write(models, dataset_path, device, batch_size, NAME, LEN, outpu
                     #     y_pred = model(DNAs)
                     # y_pred = y_pred.detach().cpu()
                     with torch.no_grad():
-                        y_pred = torch.mean(torch.stack([models[m](DNAs).detach().cpu() for m in range(len(models))]), axis=0)
+                        y_pred = torch.mean(torch.stack([models[m](DNAs, rbp_tensor).detach().cpu() for m in range(len(models))]), axis=0)
                     count += len(y_pred)  # update the count for the current batch
 
                     if debug:
@@ -1049,7 +1101,7 @@ def predict_and_write(models, dataset_path, device, batch_size, NAME, LEN, outpu
             #     y_pred = model(DNAs)
             # y_pred = y_pred.detach().cpu()
             with torch.no_grad():
-                y_pred = torch.mean(torch.stack([models[m](DNAs).detach().cpu() for m in range(len(models))]), axis=0)
+                y_pred = torch.mean(torch.stack([models[m](DNAs, rbp_tensor).detach().cpu() for m in range(len(models))]), axis=0)
             count += 1
 
             # writing to BED
@@ -1100,6 +1152,7 @@ def predict_cli(args):
     model_path = args.model
     input_sequence = args.input_sequence
     gff_file = args.annotation_file
+    rbp_expression = args.rbp_expression
     threshold = np.float32(args.threshold)
     debug = args.debug
     predict_all = args.predict_all
@@ -1157,8 +1210,9 @@ def predict_cli(args):
     device = setup_device()
 
     # load model from current state
-    model, params = load_pytorch_models(model_path, device, consts['SL'], flanking_size)
-    print(f"\t[INFO] Device: {device}, Model: {model}, Params: {params}")
+    models, params = load_pytorch_models(model_path, device, consts['SL'], flanking_size)
+    rbp_tensor = prepare_rbp_tensor(models, rbp_expression_path=rbp_expression)
+    print(f"\t[INFO] Device: {device}, Model count: {len(models)}, Params: {params}")
 
     print("--- %s seconds ---" % (time.time() - start_time))
 
@@ -1168,7 +1222,7 @@ def predict_cli(args):
         print("--- Step 4: Get predictions ... ---", flush=True)
         start_time = time.time()
 
-        predict_file = get_prediction(model, dataset_path, device, params['BATCH_SIZE'], output_base, flush_predict_threshold=consts['FLUSH_PREDICT_THRESHOLD'], debug=debug)
+        predict_file = get_prediction(models, dataset_path, device, params['BATCH_SIZE'], output_base, flush_predict_threshold=consts['FLUSH_PREDICT_THRESHOLD'], debug=debug, rbp_tensor=rbp_tensor)
 
         print("--- %s seconds ---" % (time.time() - start_time))
 
@@ -1186,13 +1240,13 @@ def predict_cli(args):
         print("--- Step 4o: Extract predictions to BED ... ---", flush=True)
         start_time = time.time()
         
-        predict_and_write(model, dataset_path, device, params['BATCH_SIZE'], NAME, LEN, output_base, threshold=threshold, debug=debug)
+        predict_and_write(models, dataset_path, device, params['BATCH_SIZE'], NAME, LEN, output_base, threshold=threshold, debug=debug, rbp_tensor=rbp_tensor)
 
         print("--- %s seconds ---" % (time.time() - start_time))  
 
 
 # Simplified in-memory prediction
-def predict(input_sequence, model_path, flanking_size):
+def predict(input_sequence, model_path, flanking_size, rbp_expression=None):
     '''
     Parameters:
     - input_sequence (str): Raw gene sequence
@@ -1216,6 +1270,7 @@ def predict(input_sequence, model_path, flanking_size):
     device = setup_device()
     print(f'\t[INFO] Device: {device}')
     models, params = load_pytorch_models(model_path, device, consts['SL'], flanking_size)
+    rbp_tensor = prepare_rbp_tensor(models, rbp_expression_path=rbp_expression)
   
     # Get predictions
     DNAs = X.to(device)
@@ -1223,7 +1278,7 @@ def predict(input_sequence, model_path, flanking_size):
     #     y_pred = model(DNAs)
     # y_pred = y_pred.detach().cpu()
     with torch.no_grad():
-        y_pred = torch.mean(torch.stack([models[m](DNAs).detach().cpu() for m in range(len(models))]), axis=0)
+        y_pred = torch.mean(torch.stack([models[m](DNAs, rbp_tensor).detach().cpu() for m in range(len(models))]), axis=0)
     y_pred = y_pred.permute(0, 2, 1).contiguous().view(-1, y_pred.shape[1])
     y_pred = y_pred[:sequence_length, :] # crop out the extra padding
 

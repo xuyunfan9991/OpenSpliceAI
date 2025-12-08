@@ -1,4 +1,5 @@
 from importlib.resources import files
+import inspect
 import logging
 import os, glob
 import platform
@@ -80,6 +81,32 @@ def load_pytorch_models(model_path, CL):
     
     # Setup device
     device = setup_device()
+    # Detect whether this torch build supports weights_only kwarg
+    load_signature = inspect.signature(torch.load)
+    supports_weights_only = "weights_only" in load_signature.parameters
+
+    def _torch_load(path):
+        try:
+            return torch.load(path, map_location=device)
+        except Exception as exc:
+            message = str(exc)
+            if supports_weights_only and "Weights only load failed" in message:
+                logging.warning(f"{os.path.basename(path)} requires full deserialization; retrying with weights_only=False.")
+                return torch.load(path, map_location=device, weights_only=False)
+            raise
+
+    def _extract_payload(obj, source_label):
+        """Unpack saved checkpoint dictionaries."""
+        temperature = None
+        metadata = None
+        if isinstance(obj, dict) and "model_state_dict" in obj:
+            temperature = obj.get("temperature")
+            metadata = obj.get("metadata")
+            obj = obj["model_state_dict"]
+            if temperature is not None:
+                temp_len = temperature.numel() if hasattr(temperature, "numel") else len(temperature)
+                logging.info(f"Loaded temperature vector ({temp_len}) from {source_label}.")
+        return obj, temperature, metadata
     
     # Load all model state dicts given the supplied model path
     if os.path.isdir(model_path):
@@ -91,8 +118,8 @@ def load_pytorch_models(model_path, CL):
         models = []
         for model_file in model_files:
             try:
-                model = torch.load(model_file, map_location=device)
-                models.append(model)
+                model_obj = _torch_load(model_file)
+                models.append((model_obj, model_file))
             except Exception as e:
                 logging.error(f"Error loading PyTorch model from file {model_file}: {e}. Skipping...")
                 
@@ -102,7 +129,7 @@ def load_pytorch_models(model_path, CL):
     
     elif os.path.isfile(model_path):
         try:
-            models = [torch.load(model_path, map_location=device)]
+            models = [(_torch_load(model_path), model_path)]
         except Exception as e:
             logging.error(f"Error loading PyTorch model from file {model_path}: {e}.")
             exit()
@@ -115,11 +142,23 @@ def load_pytorch_models(model_path, CL):
     # NOTE: supplied model paths should be state dicts, not model files  
     loaded_models = []
     
-    for state_dict in models:
+    for state_dict_obj, source_path in models:
         try: 
+            state_dict, temperature, metadata = _extract_payload(state_dict_obj, os.path.basename(source_path))
             film_config = extract_film_config_from_state_dict(state_dict)
             model, params = load_model(device, CL, film_config or None)
-            model.load_state_dict(state_dict)      # loads state dict
+            # _rbp_metadata_blob stores FiLM metadata and may differ in length across versions;
+            # drop it to avoid size-mismatch errors when loading checkpoints.
+            state_dict_to_load = {k: v for k, v in state_dict.items() if k != "_rbp_metadata_blob"}
+            model.load_state_dict(state_dict_to_load, strict=False)      # loads state dict
+            if temperature is not None:
+                if not torch.is_tensor(temperature):
+                    temperature = torch.tensor(temperature, dtype=torch.float32)
+                else:
+                    temperature = temperature.to(dtype=torch.float32)
+                model.register_buffer("_temperature_vector", temperature)
+            if metadata:
+                model._calibration_metadata = metadata
             model = model.to(device)               # puts model on device
             model.eval()                           # puts model in evaluation mode
             loaded_models.append(model)            # appends model to list of loaded models  
@@ -202,7 +241,8 @@ def one_hot_encode(seq):
     seq = seq.replace('G', '\x03').replace('T', '\x04').replace('N', '\x00')
 
     # Convert the sequence to one-hot encoded numpy array
-    return map[np.fromstring(seq, np.int8) % 5]
+    # Use frombuffer instead of fromstring (deprecated in newer NumPy versions)
+    return map[np.frombuffer(seq.encode('latin-1'), dtype=np.int8) % 5]
 
 
 ####################################################################################################################################

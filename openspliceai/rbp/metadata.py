@@ -53,7 +53,6 @@ def extract_film_config_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> 
     config = {
         "rbp_dim": rbp_dim,
         "rbp_names": metadata.get("rbp_names"),
-        "film_start": metadata.get("film_start"),
         "film_noise_std": metadata.get("film_noise_std"),
     }
     return {k: v for k, v in config.items() if v is not None}

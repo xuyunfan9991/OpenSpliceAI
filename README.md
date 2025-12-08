@@ -77,18 +77,18 @@ Annotates VCF files with delta scores and positions to evaluate the impact of ge
 </div>
 <p>The resulting JSON/NPY stores a single concatenated vector whose <code class="docutils literal notranslate"><span class="pre">rbp_names</span></code> entry reflects both the RBP and HVG feature names; the same file must be reused during training and inference.</p>
 <ol class="arabic simple" start="2">
-<li><p><strong>Condition transfer learning.</strong> Pass <code class="docutils literal notranslate"><span class="pre">--rbp-expression</span></code> (and optionally <code class="docutils literal notranslate"><span class="pre">--film-start-layer</span></code>) to modulate only the later residual units:</p></li>
+<li><p><strong>Condition transfer learning.</strong> Pass <code class="docutils literal notranslate"><span class="pre">--rbp-expression</span></code> to enable FiLM; the tissue vector modulates the tail feature map immediately before the final 1×1 head:</p></li>
 </ol>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>openspliceai transfer \
   --train-dataset /home1/xyf/data/openspliceai_data/dataset_limb/train.h5 \
   --test-dataset /home1/xyf/data/openspliceai_data/dataset_limb/test.h5 \
   --pretrained-model data/model_best.pt \
   --rbp-expression data/limb_rbp.json \
-  --film-start-layer 7 \
   --output-dir runs/limb_rbp \
   --project-name limb_rbp
 </pre></div>
 </div>
+<p><em>Note:</em> The <code class="docutils literal notranslate"><span class="pre">train</span></code> subcommand also accepts <code class="docutils literal notranslate"><span class="pre">--tissue-config</span></code> for multi-tissue joint training from scratch (no <code class="docutils literal notranslate"><span class="pre">--pretrained-model</span></code> required).</p>
 <ol class="arabic simple" start="3">
 <li><p><strong>Run RBP-aware variant annotation.</strong> Tissue-specific checkpoints store their required RBP dimensionality. The <code class="docutils literal notranslate"><span class="pre">variant</span></code> subcommand validates that the same vector is provided at inference time:</p></li>
 </ol>

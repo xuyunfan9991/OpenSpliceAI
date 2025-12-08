@@ -147,7 +147,7 @@ openspliceai transfer \
 
 - 与 `train` 相同，`train-dataset` 名称含 `train` 即可，程序会自动定位同目录 `dataset_validation.h5` 作为验证集。
 - `--rbp-expression`：指向前一步生成的 JSON/NPY，内部包含 RBP + HVG 特征（示例维度 753，经 Z-score 标准化或已提供标准化矩阵）。
-- FiLM 注入位置固定在主干末端（final 1×1 卷积前），无需 `--film-start-layer`。
+- FiLM 注入位置固定在主干末端（final 1×1 卷积前），不支持自定义起始层。
 - FiLM 侧支 MLP：`Linear(in_dim→128) → LayerNorm → ReLU → Dropout(0.2) → Linear(128→2*channels)`，输出层权重/偏置零初始化，确保初始 γ=1、β=0（热启动）。
 - 训练时默认冻结主干，始终解冻 FiLM 侧支和最终 1×1 卷积头；`--unfreeze` 额外解冻末端若干 ResidualUnit，`--unfreeze-all` 可全模型联训。
 - 训练日志结构与 `train` 类似，`model_best.pt` 中记录了 `rbp_dim`、`rbp_names` 等元信息。未提供 `--rbp-expression` 时，FiLM 会退化为 γ=1/β=0，表现等同基础模型。
@@ -195,6 +195,24 @@ openspliceai transfer \
 - 训练过程中 dataloader 会混合不同组织的 batch，FiLM γ/β 由同一侧支 MLP 生成，但使用对应组织的向量。
 - 训练完成后，Variant 阶段只需要这一份模型：运行多次 `openspliceai variant`，更换 `--rbp-expression` 指向 blood/neuron 等向量，即可得到可比较的组织特异预测。
 - 多组织模式下不再自动缩放 batch_size，仍用单组织基准批量（flanking=400 默认每卡 18×GPU 数）。梯度累积步数默认为组织数。若显存吃紧，可手动调低基准批量或 `--unfreeze`。
+- `train` 同样支持 `--tissue-config` 做多组织联合训练；用法与上面类似，只是不需要传 `--pretrained-model`（从头训练）。
+
+`train` 多组织示例（从零开始联合训练一份 FiLM 模型）：
+
+```bash
+openspliceai train \
+  --tissue-config config/tissues.json \
+  --flanking-size 400 \
+  --epochs 8 \
+  --lr 1e-3 \
+  --film-lr-mult 1.0 \
+  --loss focal_loss \
+  --focal-alpha 0.25 0.25 0.5 \
+  --focal-gamma 2.0 \
+  --output-dir runs/shared_film_train \
+  --project-name shared_film_train \
+  --early-stopping --patience 2
+```
 
 ---
 

@@ -50,10 +50,16 @@ def parse_args_train(subparsers):
     parser_train.add_argument('--exp-num', '-e', type=str, default="0", help="Experiment number")
     parser_train.add_argument('--flanking-size', '-f', type=int, default=80, choices=[80, 400, 2000, 10000], help="Flanking sequence size")
     parser_train.add_argument('--random-seed', '-r', type=int, default=42, help="Random seed for reproducibility")
-    parser_train.add_argument('--train-dataset', '-train', type=str, required=True, help="Path to the training dataset")
-    parser_train.add_argument('--test-dataset', '-test', type=str, required=True, help="Path to the testing dataset")
+    parser_train.add_argument('--train-dataset', '-train', type=str, required=False, help="Path to the training dataset (omit when using --tissue-config)")
+    parser_train.add_argument('--test-dataset', '-test', type=str, required=False, help="Path to the testing dataset (omit when using --tissue-config)")
     parser_train.add_argument("--loss", '-l', type=str, default='cross_entropy_loss', choices=["cross_entropy_loss", "focal_loss"], help="Loss function for training")
     parser_train.add_argument('--model', '-m', default="SpliceAI", type=str)
+    parser_train.add_argument("--lr", type=float, default=1e-3, help="Learning rate for training (AdamW)")
+    parser_train.add_argument("--film-lr-mult", type=float, default=1.0, help="Multiplier applied to FiLM branch learning rate")
+    parser_train.add_argument('--rbp-expression', type=str, help='Path to an RBP expression vector (JSON/NPY) used for FiLM conditioning')
+    parser_train.add_argument('--tissue-config', type=str,
+                              help='Optional JSON describing multiple tissues (train/valid/test datasets + RBP vectors) for joint FiLM training.')
+    parser_train.add_argument('--nofilm', action='store_true', help='Disable FiLM conditioning even if expression vectors are provided.')
     parser_train.add_argument("--focal-alpha", nargs='+', type=float, help="Class-wise alpha for focal loss (scalar or per-class list)")
     parser_train.add_argument("--focal-gamma", type=float, help="Gamma for focal loss")
 
@@ -113,7 +119,6 @@ def parse_args_transfer(subparsers):
     parser_transfer.add_argument("--unfreeze-all", '-A', action='store_true', default=False, help='Unfreeze all layers for fine-tuning')
     parser_transfer.add_argument("--unfreeze", '-u', type=int, default=1, help="Number of layers to unfreeze for fine-tuning")
     parser_transfer.add_argument('--rbp-expression', type=str, help='Path to an RBP expression vector (JSON/NPY) used for FiLM conditioning')
-    parser_transfer.add_argument('--film-start-layer', type=int, default=None, help='1-based residual unit index to start FiLM conditioning (defaults to half of the network)')
     parser_transfer.add_argument('--tissue-config', type=str,
                                  help='Optional JSON describing multiple tissues (train/valid/test datasets + RBP vectors) for joint FiLM training.')
     parser_transfer.add_argument('--nofilm', action='store_true', help='Disable FiLM conditioning even if expression vectors are provided.')
