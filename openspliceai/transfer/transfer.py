@@ -20,7 +20,8 @@ from openspliceai.train_base.utils import *
 def initialize_model_and_optim_transfer(device, flanking_size, epochs, scheduler,
                                pretrained_model, unfreeze, unfreeze_all,
                                rbp_expression_path=None, film_start_layer=None,
-                               disable_film: bool = False):
+                               disable_film: bool = False, lr: float = 1e-4,
+                               film_lr_mult: float = 1.0):
     L = 32
     N_GPUS = max(1, torch.cuda.device_count()) if torch.cuda.is_available() else 1
     W = np.asarray([11, 11, 11, 11])
@@ -111,8 +112,22 @@ def initialize_model_and_optim_transfer(device, flanking_size, epochs, scheduler
                     unfrozen += 1
                     if unfrozen >= unfreeze:
                         break
-    # Set up optimizer and scheduler
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+    # Set up optimizer and scheduler (optionally boost FiLM LR)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    film_params = []
+    if getattr(model, "expression_film", None) is not None:
+        film_params = [p for p in model.expression_film.parameters() if p.requires_grad]
+    if film_params and film_lr_mult != 1.0:
+        film_param_ids = {id(p) for p in film_params}
+        other_params = [p for p in trainable_params if id(p) not in film_param_ids]
+        param_groups = []
+        if other_params:
+            param_groups.append({"params": other_params, "lr": lr})
+        param_groups.append({"params": film_params, "lr": lr * film_lr_mult})
+        optimizer = optim.AdamW(param_groups, lr=lr)
+        print(f"[OPT] Using split LR: base={lr} FiLM={lr * film_lr_mult}")
+    else:
+        optimizer = optim.AdamW(trainable_params, lr=lr)
     if scheduler == "MultiStepLR":
         scheduler_obj = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[epochs-4, epochs-3, epochs-2, epochs-1], gamma=0.5)
     elif scheduler == "CosineAnnealingWarmRestarts":
@@ -147,7 +162,8 @@ def transfer(args):
     model, optimizer, scheduler, params, rbp_context = initialize_model_and_optim_transfer(
         device, args.flanking_size, args.epochs, args.scheduler, args.pretrained_model,
         args.unfreeze, args.unfreeze_all, rbp_expression_path=args.rbp_expression,
-        film_start_layer=args.film_start_layer, disable_film=args.nofilm)
+        film_start_layer=args.film_start_layer, disable_film=args.nofilm,
+        lr=args.lr, film_lr_mult=args.film_lr_mult)
     
     params["RANDOM_SEED"] = args.random_seed
     train_metric_files = create_metric_files(log_output_train_base)
@@ -188,7 +204,8 @@ def transfer_multi_tissue(args):
     model, optimizer, scheduler, params, _ = initialize_model_and_optim_transfer(
         device, args.flanking_size, args.epochs, args.scheduler, args.pretrained_model,
         args.unfreeze, args.unfreeze_all, rbp_expression_path=primary_expr_path,
-        film_start_layer=args.film_start_layer, disable_film=args.nofilm)
+        film_start_layer=args.film_start_layer, disable_film=args.nofilm,
+        lr=args.lr, film_lr_mult=args.film_lr_mult)
     params["RANDOM_SEED"] = args.random_seed
     tissues = load_tissue_entries(tissue_specs, disable_film=args.nofilm)
     print(f"[FiLM][multi] Using batch_size={params['BATCH_SIZE']} per mini-batch; "

@@ -29,7 +29,8 @@ openspliceai --help
 2. **train**：在生成的 HDF5 上训练基础模型（无 FiLM，捕捉通用剪接规则）。
 3. **prepare_rbp_expression**：为目标组织生成条件向量（RBP + HVG）。
 4. **transfer**：加载基础模型 checkpoint，开启 FiLM，在组织特异数据上微调。
-5. **variant**：使用组织特异模型 + 条件向量对 VCF 进行剪接影响注释。
+5. **predict**：使用组织特异模型 + 条件向量，对 FASTA 序列直接做剪接位点预测（输出 BED）。
+6. **variant**：使用组织特异模型 + 条件向量对 VCF 进行剪接影响注释。
 
 以下章节将详细说明每一步。
 
@@ -197,7 +198,31 @@ openspliceai transfer \
 
 ---
 
-## 7. Step 5：Variant 注释 (`variant`)
+## 7. Step 5：序列级预测 (`predict`)
+
+`predict` 现在支持 RBP/HVG 条件向量，可直接对 FASTA 序列输出组织特异的剪接位点 BED。示例：
+
+```bash
+openspliceai predict \
+  --input-sequence data/neuron_genes.fa \
+  --model runs/shared_film/model_best.pt \
+  --flanking-size 10000 \
+  --rbp-expression data/neuron_features.json \
+  --output-dir predict_out/neuron/ \
+  --threshold 1e-6 \
+  --predict-all
+```
+
+说明与注意：
+
+- `--rbp-expression` 与 `variant` 用法一致，必须与 FiLM checkpoint 中记录的 `rbp_dim`/`rbp_names` 对齐；缺失时会报错，维度或顺序不匹配也会报错。
+- 若加载的是无 FiLM 的基础模型，可省略 `--rbp-expression`，此时预测等同于标准 SpliceAI。
+- `--predict-all` 会先写中间 HDF5/pt，再生成 BED；关闭该选项则直接边预测边写 BED，节省磁盘。
+- 输出的 `acceptor_predictions.bed`、`donor_predictions.bed` 可按组织对比（如 limb vs neuron）。
+
+---
+
+## 8. Step 6：Variant 注释 (`variant`)
 
 最后，将 VCF 输入组织特异模型即可得到 delta 分数和剪接位点位移：
 

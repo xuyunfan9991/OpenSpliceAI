@@ -18,6 +18,20 @@ from tqdm import tqdm
 from sklearn.metrics import average_precision_score, precision_recall_fscore_support, accuracy_score
 from openspliceai.constants import *
 
+# Optional global overrides for focal loss hyperparameters (configured via CLI)
+_FOCAL_ALPHA_OVERRIDE = None
+_FOCAL_GAMMA_OVERRIDE = None
+
+
+def set_focal_params(alpha=None, gamma=None):
+    """
+    Configure global focal loss hyperparameters (alpha can be scalar or list of per-class weights).
+    Passing None resets to defaults.
+    """
+    global _FOCAL_ALPHA_OVERRIDE, _FOCAL_GAMMA_OVERRIDE
+    _FOCAL_ALPHA_OVERRIDE = alpha
+    _FOCAL_GAMMA_OVERRIDE = gamma
+
 def setup_environment(args):
     assert int(args.flanking_size) in [80, 400, 2000, 10000]
     device = setup_device()
@@ -271,7 +285,7 @@ def create_metric_files(log_output_base):
     metric_types = ['donor_topk_all', 'donor_topk', 'donor_auprc', 'donor_accuracy', 'donor_precision', 
                     'donor_recall', 'donor_f1', 'acceptor_topk_all', 'acceptor_topk', 'acceptor_auprc', 
                     'acceptor_accuracy', 'acceptor_precision', 'acceptor_recall', 'acceptor_f1', 
-                    'accuracy', 'loss_batch', 'loss_every_update', 'learning_rate_every_epoch', 'learning_rate_every_batch']
+                    'accuracy', 'micro_accuracy', 'loss_batch', 'loss_every_update', 'learning_rate_every_epoch', 'learning_rate_every_batch']
     return {metric: f'{log_output_base}/{metric}.txt' for metric in metric_types}
 
 
@@ -322,15 +336,18 @@ def metrics(batch_ypred, batch_ylabel, metric_files, run_mode):
     predicted_classes = predicted_classes.numpy()
     true_classes_flat = true_classes.flatten()
     predicted_classes_flat = predicted_classes.flatten()
-    accuracy = accuracy_score(true_classes_flat, predicted_classes_flat)
+    micro_accuracy = accuracy_score(true_classes_flat, predicted_classes_flat)
     precision, recall, f1, _ = precision_recall_fscore_support(true_classes_flat, predicted_classes_flat, average=None)
     class_accuracies = classwise_accuracy(true_classes, predicted_classes, 3)
     overall_accuracy = np.mean(class_accuracies)
-    print(f"Overall Accuracy: {overall_accuracy}")
+    print(f"Overall Accuracy (balanced): {overall_accuracy}")
+    print(f"Micro Accuracy (sample-level): {micro_accuracy}")
     for k, v in metric_files.items():
         with open(v, 'a') as f:
             if k == "accuracy":
                 f.write(f"{overall_accuracy}\n")
+            elif k == "micro_accuracy":
+                f.write(f"{micro_accuracy}\n")
     ss_types = ["Non-splice", "acceptor", "donor"]
     for i, (acc, prec, rec, f1_score) in enumerate(zip(class_accuracies, precision, recall, f1)):
         print(f"Class {ss_types[i]}\t: Accuracy={acc}, Precision={prec}, Recall={rec}, F1={f1_score}")
@@ -593,19 +610,32 @@ def focal_loss(y_true, y_pred, alpha=0.25, gamma=2.0):
     """
     Compute 2D focal loss.
     """
+    # Allow CLI overrides
+    use_alpha = _FOCAL_ALPHA_OVERRIDE if _FOCAL_ALPHA_OVERRIDE is not None else alpha
+    use_gamma = _FOCAL_GAMMA_OVERRIDE if _FOCAL_GAMMA_OVERRIDE is not None else gamma
     epsilon = 1e-10
     y_pred = torch.clamp(y_pred, epsilon, 1. - epsilon)
 
+    num_classes = y_pred.shape[1]
     # Allow alpha to be scalar or class-wise iterable/tensor.
-    if isinstance(alpha, (list, tuple)):
-        alpha_tensor = y_pred.new_tensor(alpha, dtype=y_pred.dtype)
-    elif torch.is_tensor(alpha):
-        alpha_tensor = alpha.to(dtype=y_pred.dtype, device=y_pred.device)
+    if isinstance(use_alpha, (list, tuple, np.ndarray)):
+        alpha_array = np.asarray(use_alpha, dtype=np.float32)
+        if alpha_array.size == 1:
+            alpha_array = np.repeat(alpha_array, num_classes)
+        elif alpha_array.size != num_classes:
+            raise ValueError(f"focal alpha length {alpha_array.size} != num_classes {num_classes}")
+        alpha_tensor = y_pred.new_tensor(alpha_array, dtype=y_pred.dtype, device=y_pred.device)
+    elif torch.is_tensor(use_alpha):
+        alpha_tensor = use_alpha.to(dtype=y_pred.dtype, device=y_pred.device)
+        if alpha_tensor.numel() == 1:
+            alpha_tensor = alpha_tensor.expand(num_classes)
+        elif alpha_tensor.numel() != num_classes:
+            raise ValueError(f"focal alpha length {alpha_tensor.numel()} != num_classes {num_classes}")
     else:
-        alpha_tensor = y_pred.new_full((y_pred.shape[1],), float(alpha), dtype=y_pred.dtype)
+        alpha_tensor = y_pred.new_full((num_classes,), float(use_alpha), dtype=y_pred.dtype)
     alpha_tensor = alpha_tensor.view(1, -1, 1)
 
-    weight = torch.pow(1 - y_pred, gamma)
+    weight = torch.pow(1 - y_pred, use_gamma)
     loss = -alpha_tensor * y_true * weight * torch.log(y_pred)
     return loss.sum(dim=1).mean()
 

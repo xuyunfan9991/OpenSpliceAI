@@ -82,6 +82,8 @@ class SpliceAI(nn.Module):
         self.film_config = self._normalize_film_config(film_config, len(W))
         self.film_enabled = bool(self.film_config)
         self._warned_missing_rbp = False
+        # film_strength lets us scale FiLM effect without retraining; 1.0 keeps behavior unchanged.
+        self.film_strength = 1.0
         self.residual_units = nn.ModuleList()
         for i, (w, r) in enumerate(zip(W, AR)):
             self.residual_units.append(ResidualUnit(L, w, r, film_dim=None))
@@ -172,6 +174,10 @@ class SpliceAI(nn.Module):
         final_x = self.crop(skip)
         if self.expression_film is not None and rbp_batch is not None:
             gamma, beta = self.expression_film(rbp_batch)
+            if self.film_strength != 1.0:
+                # amplify deviation from identity to strengthen tissue conditioning
+                gamma = 1.0 + (gamma - 1.0) * self.film_strength
+                beta = beta * self.film_strength
             final_x = gamma * final_x + beta
         out = self.final_conv(final_x)
         if self.apply_softmax:
