@@ -480,6 +480,13 @@ def apply_model_temperature(model, logits):
     return logits / temperature
 
 
+def model_predict_proba(model, inputs, rbp_tensor=None):
+    """Run model forward, apply temperature scaling, then softmax to probabilities."""
+    logits = model(inputs, rbp_tensor)
+    logits = apply_model_temperature(model, logits)
+    return torch.softmax(logits, dim=1)
+
+
 def load_pytorch_models(model_path, device, SL, CL):
     """
     Loads a SpliceAI PyTorch model from given state, inferring device.
@@ -531,7 +538,7 @@ def load_pytorch_models(model_path, device, SL, CL):
         print(f"\t[INFO] Context nucleotides {CL}")
         print(f"\t[INFO] Sequence length (output): {SL}")
         
-        model = SpliceAI(L, W, AR, film_config=film_config or None).to(device)
+        model = SpliceAI(L, W, AR, apply_softmax=False, film_config=film_config or None).to(device)
         params = {'L': L, 'W': W, 'AR': AR, 'CL': CL, 'SL': SL, 'BATCH_SIZE': BATCH_SIZE, 'N_GPUS': N_GPUS}
 
         return model, params
@@ -778,9 +785,8 @@ def get_prediction(models, dataset_path, device, batch_size, output_dir, flush_p
                 predictions = []
                 for model in models:
                     with torch.no_grad():
-                        logits = model(DNAs, rbp_tensor)
-                        logits = apply_model_temperature(model, logits)
-                    predictions.append(logits.detach().cpu())
+                        probs = model_predict_proba(model, DNAs, rbp_tensor)
+                    predictions.append(probs.detach().cpu())
                 y_pred = torch.mean(torch.stack(predictions), axis=0)
 
                 if debug:
@@ -829,9 +835,8 @@ def get_prediction(models, dataset_path, device, batch_size, output_dir, flush_p
             predictions = []
             for model in models:
                 with torch.no_grad():
-                    logits = model(DNAs, rbp_tensor)
-                    logits = apply_model_temperature(model, logits)
-                predictions.append(logits.detach().cpu())
+                    probs = model_predict_proba(model, DNAs, rbp_tensor)
+                predictions.append(probs.detach().cpu())
 
             y_pred = torch.mean(torch.stack(predictions), axis=0)
             batch_ypred.append(y_pred)
@@ -1045,7 +1050,11 @@ def predict_and_write(models, dataset_path, device, batch_size, NAME, LEN, outpu
                     #     y_pred = model(DNAs)
                     # y_pred = y_pred.detach().cpu()
                     with torch.no_grad():
-                        y_pred = torch.mean(torch.stack([models[m](DNAs, rbp_tensor).detach().cpu() for m in range(len(models))]), axis=0)
+                        stacked_probs = [
+                            model_predict_proba(models[m], DNAs, rbp_tensor).detach().cpu()
+                            for m in range(len(models))
+                        ]
+                        y_pred = torch.mean(torch.stack(stacked_probs), axis=0)
                     count += len(y_pred)  # update the count for the current batch
 
                     if debug:
@@ -1101,7 +1110,11 @@ def predict_and_write(models, dataset_path, device, batch_size, NAME, LEN, outpu
             #     y_pred = model(DNAs)
             # y_pred = y_pred.detach().cpu()
             with torch.no_grad():
-                y_pred = torch.mean(torch.stack([models[m](DNAs, rbp_tensor).detach().cpu() for m in range(len(models))]), axis=0)
+                stacked_probs = [
+                    model_predict_proba(models[m], DNAs, rbp_tensor).detach().cpu()
+                    for m in range(len(models))
+                ]
+                y_pred = torch.mean(torch.stack(stacked_probs), axis=0)
             count += 1
 
             # writing to BED
@@ -1278,7 +1291,11 @@ def predict(input_sequence, model_path, flanking_size, rbp_expression=None):
     #     y_pred = model(DNAs)
     # y_pred = y_pred.detach().cpu()
     with torch.no_grad():
-        y_pred = torch.mean(torch.stack([models[m](DNAs, rbp_tensor).detach().cpu() for m in range(len(models))]), axis=0)
+        stacked_probs = [
+            model_predict_proba(models[m], DNAs, rbp_tensor).detach().cpu()
+            for m in range(len(models))
+        ]
+        y_pred = torch.mean(torch.stack(stacked_probs), axis=0)
     y_pred = y_pred.permute(0, 2, 1).contiguous().view(-1, y_pred.shape[1])
     y_pred = y_pred[:sequence_length, :] # crop out the extra padding
 

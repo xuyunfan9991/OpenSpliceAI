@@ -162,8 +162,8 @@ class ModelWithTemperature(nn.Module):
 
             # loss = ece_criterion(filtered_logits, filtered_labels)
             # nll_loss = nll_criterion(filtered_logits, filtered_labels)
-            loss = nll_criterion(self.logits, self.labels) 
-            ece_loss = ece_criterion(self.logits, self.labels)
+            loss = nll_criterion(scaled_logits, self.labels) 
+            ece_loss = ece_criterion(scaled_logits, self.labels)
 
             loss.backward()
             optimizer.step()
@@ -201,8 +201,8 @@ class ModelWithTemperature(nn.Module):
         #     return
         # filtered_logits = scaled_logits[mask][:, 1:]
         # filtered_labels = (self.labels[mask] - 1).long()
-        nll = nll_criterion(self.logits, self.labels).item()
-        ece = ece_criterion(self.logits, self.labels).item()
+        nll = nll_criterion(scaled_logits, self.labels).item()
+        ece = ece_criterion(scaled_logits, self.labels).item()
         print(f'{phase} - NLL: {nll:.8f}, ECE: {ece:.8f}')
 
     def compute_ece_nll(self, logits, labels):
@@ -219,8 +219,9 @@ class ModelWithTemperature(nn.Module):
         # filtered_labels = (labels[mask] - 1).long()
         nll_criterion = nn.CrossEntropyLoss().to(device)
         ece_criterion = _ECELoss().to(device)
-        nll = nll_criterion(logits, labels).item()
-        ece = ece_criterion(logits, labels).item()
+        scaled_logits = self.temperature_scale(logits)
+        nll = nll_criterion(scaled_logits, labels).item()
+        ece = ece_criterion(scaled_logits, labels).item()
         return nll, ece
 
 

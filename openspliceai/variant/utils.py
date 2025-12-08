@@ -74,7 +74,7 @@ def load_pytorch_models(model_path, CL):
         print(f"\t[INFO] Context nucleotides {CL}")
         print(f"\t[INFO] Sequence length (output): {SL}")
         
-        model = SpliceAI(L, W, AR, film_config=film_config).to(device)
+        model = SpliceAI(L, W, AR, apply_softmax=False, film_config=film_config).to(device)
         params = {'L': L, 'W': W, 'AR': AR, 'CL': CL, 'SL': SL, 'BATCH_SIZE': BATCH_SIZE, 'N_GPUS': N_GPUS}
 
         return model, params
@@ -572,12 +572,8 @@ def get_delta_scores(record, ann, dist_var, mask, flanking_size=10000, precision
                     y_alt_preds = []
                     for m in range(len(ann.models)):
                         model = ann.models[m]
-                        if cond is None:
-                            y_ref_preds.append(model(x_ref).detach().cpu())
-                            y_alt_preds.append(model(x_alt).detach().cpu())
-                        else:
-                            y_ref_preds.append(model(x_ref, cond).detach().cpu())
-                            y_alt_preds.append(model(x_alt, cond).detach().cpu())
+                        y_ref_preds.append(model_predict_proba(model, x_ref, cond).detach().cpu())
+                        y_alt_preds.append(model_predict_proba(model, x_alt, cond).detach().cpu())
                     y_ref = torch.mean(torch.stack(y_ref_preds), axis=0)
                     y_alt = torch.mean(torch.stack(y_alt_preds), axis=0)
                 
